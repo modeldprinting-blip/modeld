@@ -3,6 +3,7 @@ import json
 import uuid
 import asyncio
 import subprocess
+import traceback
 import httpx
 import trimesh
 import numpy as np
@@ -51,7 +52,7 @@ SYSTEM_PROMPT = """
 }
 
 Ако СЕ е јасно и физички возможно за печатење, одлучи кој генератор е подобар:
-- Користи `"mode": "cad"` за геометриски/функционални делови (чаша, кутија, држач, цилиндар, плочка, организатор, капак).
+- Користи `"mode": "cad"` за геометриски/функционални делови (чаша, кутија, држач, прстен, цилиндар, плочка, организатор, капак).
 - Користи `"mode": "tripo"` за сложени/органски форми (фигура, животно, скулптура, статуа, сложен уметнички објект).
 
 Врати JSON:
@@ -63,7 +64,7 @@ SYSTEM_PROMPT = """
   "material_reason": "Објаснување на македонски зошто оваа пластика е најдобра за намената.",
   "tripo_prompt": "Детален опис на англиски за 3D моделот (ако mode е tripo), без позадина, solid 3d printable object",
   "target_height_mm": 80.0,
-  "cad_script": "Целосен Python код со библиотеката `trimesh` (и `np`) кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm (ако mode е cad). Користи само trimesh.creation (box, cylinder, capsule, annulus) и trimesh.util.concatenate или boolean операции со manifold3d/scad доколку се достапни, а за шупливи предмети како чаша користи `trimesh.creation.annulus(r_min=37, r_max=40, height=97)` споен со дно `trimesh.creation.cylinder(radius=40, height=3)` преку `trimesh.util.concatenate([bottom, walls])` за 100% сигурно извршување без надворешни зависности!"
+  "cad_script": "Целосен Python код со библиотеката `trimesh` (и `np`) кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm (ако mode е cad). Користи исклучиво `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.capsule`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`! Не користи boolean difference/intersection за да нема потреба од надворешни библиотеки."
 }
 Врати САМО чист JSON без markdown ознаки.
 """
@@ -95,7 +96,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         )
         res_data = res.json()
         if res_data.get("code") != 0:
-            raise HTTPException(status_code=500, detail=f"Tripo Error: {res_data}")
+            raise RuntimeError(f"Tripo Error: {res_data}")
         task_id = res_data["data"]["task_id"]
 
         model_url = None
@@ -107,10 +108,10 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
                 model_url = s_data["output"].get("model") or s_data["output"].get("pbr_model")
                 break
             elif s_data["status"] in ["failed", "cancelled"]:
-                raise HTTPException(status_code=500, detail="Tripo 3D генерацијата не успеа.")
+                raise RuntimeError("Tripo 3D генерацијата не успеа.")
 
         if not model_url:
-            raise HTTPException(status_code=504, detail="Tripo 3D истече времето.")
+            raise RuntimeError("Tripo 3D истече времето.")
 
         glb_path = output_stl_path.replace(".stl", ".glb")
         glb_bytes = (await http.get(model_url)).content
@@ -126,7 +127,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
 @app.post("/api/generate")
 async def generate_3d(req: ChatRequest):
     if not client:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY не е поставен на серверот.")
+        return {"status": "needs_info", "message": "Грешка: GEMINI_API_KEY не е поставен на серверот."}
 
     conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
 
@@ -159,76 +160,86 @@ async def generate_3d(req: ChatRequest):
         }
 
     try:
-        ai_data = json.loads(response.text.strip())
+        raw_text = response.text.strip()
+        if raw_text.startswith("```"):
+            raw_text = raw_text.strip("`").replace("json\n", "", 1).strip()
+        ai_data = json.loads(raw_text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI JSON Error: {str(e)}")
+        return {"status": "needs_info", "message": f"AI JSON грешка: {str(e)}"}
 
-    if ai_data["status"] == "needs_info":
+    if ai_data.get("status") == "needs_info":
         return ai_data
 
     model_id = str(uuid.uuid4())[:8]
     verified_stl_path = f"generated_models/{model_id}_verified.stl"
     gcode_path = f"generated_models/{model_id}.gcode"
 
-    if ai_data.get("mode") == "tripo" and TRIPO_API_KEY:
-        final_mesh = await generate_with_tripo(
-            ai_data["tripo_prompt"],
-            verified_stl_path,
-            float(ai_data.get("target_height_mm", 80.0))
-        )
-    else:
-        local_env = {"trimesh": trimesh, "np": np}
-        exec(ai_data["cad_script"], {}, local_env)
-        final_mesh = local_env["final_mesh"]
+    try:
+        if ai_data.get("mode") == "tripo" and TRIPO_API_KEY:
+            final_mesh = await generate_with_tripo(
+                ai_data["tripo_prompt"],
+                verified_stl_path,
+                float(ai_data.get("target_height_mm", 80.0))
+            )
+        else:
+            local_env = {"trimesh": trimesh, "np": np}
+            exec(ai_data["cad_script"], {}, local_env)
+            final_mesh = local_env["final_mesh"]
 
-    # Физичка проверка и поправка на мрежата
-    trimesh.repair.fill_holes(final_mesh)
-    trimesh.repair.fix_normals(final_mesh)
-    final_mesh.apply_translation([0, 0, -final_mesh.bounds[0][2]])
-    final_mesh.export(verified_stl_path)
+        trimesh.repair.fill_holes(final_mesh)
+        trimesh.repair.fix_normals(final_mesh)
+        final_mesh.apply_translation([0, 0, -final_mesh.bounds[0][2]])
+        final_mesh.export(verified_stl_path)
 
-    # Вистински PrusaSlicer CLI за Supports, грами и време
-    slicer_cmd = [
-        "prusa-slicer",
-        "--export-gcode",
-        "--support-material",
-        "--support-material-auto",
-        "--layer-height", "0.2",
-        "--fill-density", "20%",
-        "-o", gcode_path,
-        verified_stl_path
-    ]
-    subprocess.run(slicer_cmd, check=True)
+        slicer_cmd = [
+            "prusa-slicer",
+            "--export-gcode",
+            "--support-material",
+            "--support-material-auto",
+            "--layer-height", "0.2",
+            "--fill-density", "20%",
+            "-o", gcode_path,
+            verified_stl_path
+        ]
+        proc = subprocess.run(slicer_cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"PrusaSlicer error: {proc.stderr or proc.stdout}")
 
-    grams_used = 0.0
-    print_time_str = "0m"
-    with open(gcode_path, "r") as f:
-        for line in f.readlines()[-60:]:
-            if "filament used [g]" in line:
-                grams_used = float(line.split("=")[1].strip())
-            if "estimated printing time (normal mode)" in line:
-                print_time_str = line.split("=")[1].strip()
+        grams_used = 0.0
+        print_time_str = "0m"
+        with open(gcode_path, "r") as f:
+            for line in f.readlines()[-60:]:
+                if "filament used [g]" in line:
+                    grams_used = float(line.split("=")[1].strip())
+                if "estimated printing time (normal mode)" in line:
+                    print_time_str = line.split("=")[1].strip()
 
-    rec_mat = ai_data["recommended_material"]
-    material_cost = grams_used * MATERIAL_PRICES_MKD_PER_G.get(rec_mat, 1.5)
-    selling_price = round(material_cost * 3, 0)  # +200% маржа
+        rec_mat = ai_data.get("recommended_material", "PLA")
+        material_cost = grams_used * MATERIAL_PRICES_MKD_PER_G.get(rec_mat, 1.5)
+        selling_price = round(material_cost * 3, 0)
 
-    return {
-        "status": "ready",
-        "model_id": model_id,
-        "stl_url": f"/models/{model_id}_verified.stl",
-        "message": ai_data["message"],
-        "recommended_material": rec_mat,
-        "material_reason": ai_data["material_reason"],
-        "stats": {
-            "grams": round(grams_used, 1),
-            "print_time": print_time_str,
-            "material_cost_mkd": round(material_cost, 0),
-            "selling_price_mkd": selling_price,
-            "is_watertight": bool(final_mesh.is_watertight),
-            "dimensions_mm": [round(x, 1) for x in final_mesh.extents]
+        return {
+            "status": "ready",
+            "model_id": model_id,
+            "stl_url": f"/models/{model_id}_verified.stl",
+            "message": ai_data["message"],
+            "recommended_material": rec_mat,
+            "material_reason": ai_data["material_reason"],
+            "stats": {
+                "grams": round(grams_used, 1),
+                "print_time": print_time_str,
+                "material_cost_mkd": round(material_cost, 0),
+                "selling_price_mkd": selling_price,
+                "is_watertight": bool(final_mesh.is_watertight),
+                "dimensions_mm": [round(x, 1) for x in final_mesh.extents]
+            }
         }
-    }
+    except Exception as e:
+        print("3D/SLICER ERROR:", traceback.format_exc())
+        return {
+            "status": "needs_info",
+            "message": f"Техничка грешка при 3D генерација: {str(e)}"
+        }
 
 @app.post("/api/order")
 async def create_order(order: OrderRequest):
