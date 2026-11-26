@@ -130,14 +130,27 @@ async def generate_3d(req: ChatRequest):
 
     conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=conversation_text,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json"
-        )
-    )
+    models_to_try = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-2.5-flash"]
+    response = None
+    last_err = None
+
+    for m_name in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=m_name,
+                contents=conversation_text,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json"
+                )
+            )
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if response is None:
+        raise HTTPException(status_code=503, detail=f"AI моделите се моментално зафатени: {str(last_err)}")
 
     try:
         ai_data = json.loads(response.text.strip())
