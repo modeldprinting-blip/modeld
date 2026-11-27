@@ -59,13 +59,14 @@ SYSTEM_PROMPT = """
 }
 
 Ако СЕ е јасно и физички возможно за печатење, одлучи кој генератор е подобар:
-- Користи `"mode": "tripo"` за 95% од предметите: СЕКОЈ реален, ергономски, уметнички, органски или детален објект (новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил, сноуборд везови / snowboard bindings, маска, рачка, кацига, држач за телефон, вазна, чаша со релјеф, резервен дел со сложен облик).
+- Користи `"mode": "tripo"` за 95% од предметите: СЕКОЈ реален, ергономски, уметнички, органски или детален објект (држач за телефон, новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил, сноуборд везови, маска, рачка, кацига, вазна, чаша со релјеф, резервен дел).
 - Користи `"mode": "cad"` ИСКЛУЧИВО за наједноставна геометрија од 1 форма: обичен прстен, цилиндар, коцка, рамна плочка, цевка, конус.
 
-ВАЖНО:
-1. Во `tripo_prompt` НЕ ставај бројки и димензии во mm/cm, туку пиши чист визуелен опис на англиски (пр. "A single 3D printable Christmas tree with layered branches and star on top on a flat circular base, solid watertight clay model").
-2. Во `cad_script` напиши ИСКЛУЧИВО валиден Python код со `trimesh` кој ја дефинира променливата `final_mesh` (НИКОГАШ OpenSCAD код, НИКОГАШ `.buffer()`).
-3. Во `target_height_mm` стави ја висината во милиметри (ако корисникот дал cm, помножи со 10; минимум 15.0, максимум 220.0).
+КРИТИЧНИ ПРАВИЛА ЗА `tripo_prompt`:
+- Дури и ако корисникот напише долг текст со барања за STEP фајлови, технички цртежи, документација или милиметри, во `tripo_prompt` НИКОГАШ не ги вклучувај тие зборови и НИКОГАШ не ставај бројки!
+- Напиши САМО краток, чист визуелен опис на самиот 3D објект во 10-20 зборови на англиски (пр. "A sleek modern smartphone desk stand with angled backrest, bottom lip, charging cable slot, and two side support ribs").
+- Во `cad_script` напиши ИСКЛУЧИВО краток, 100% валиден Python код со `trimesh` кој ја дефинира `final_mesh` (користејќи само `trimesh.creation.box`, `cylinder`, `cone`, `icosphere` и `trimesh.util.concatenate`).
+- Во `target_height_mm` стави ја висината во милиметри (минимум 15.0, максимум 220.0).
 
 Врати JSON со ТОЧНО овие имиња на полиња:
 {
@@ -84,9 +85,9 @@ SYSTEM_PROMPT = """
     "print_speed": "50 mm/s",
     "adhesion": "Skirt / Brim 5mm"
   },
-  "tripo_prompt": "A single 3D printable solid object on a flat base, clean geometry, no floating parts, untextured clay render: [детален опис на англиски без бројки]",
+  "tripo_prompt": "A single 3D printable solid object on a flat base, clean geometry, no floating parts, untextured white clay model: [краток визуелен опис на англиски]",
   "target_height_mm": 100.0,
-  "cad_script": "final_mesh = trimesh.creation.cone(radius=25.0, height=100.0)"
+  "cad_script": "final_mesh = trimesh.creation.box(extents=[80.0, 80.0, 100.0])"
 }
 Одговори ИСКЛУЧИВО со валиден JSON објект, без никаков дополнителен текст пред или после него.
 """
@@ -155,7 +156,7 @@ async def call_groq(history: list[dict]) -> str:
     raise RuntimeError(last_error)
 
 async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_mm: float):
-    clean_prompt = str(prompt).strip()[:450]
+    clean_prompt = str(prompt).strip()[:300]
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {TRIPO_API_KEY}"
@@ -172,7 +173,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         task_id = res_data["data"]["task_id"]
 
         model_url = None
-        for _ in range(55):
+        for _ in range(60):
             await asyncio.sleep(2)
             status_res = await http.get(f"[https://api.tripo3d.ai/v2/openapi/task/](https://api.tripo3d.ai/v2/openapi/task/){task_id}", headers=headers)
             s_data = status_res.json().get("data", {})
@@ -204,7 +205,6 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         scale_factor = clamped_height / current_height
         loaded.apply_scale(scale_factor)
 
-        # Заштита да не ги надмине димензиите на 3D печатачот по X или Y
         max_xy = max(loaded.extents[0], loaded.extents[1])
         if max_xy > 230.0:
             loaded.apply_scale(230.0 / max_xy)
@@ -259,7 +259,7 @@ async def generate_3d(req: ChatRequest):
 
         tripo_prompt = (ai_data.get("tripo_prompt") or ai_data.get("prompt") or "").strip()
         if not tripo_prompt:
-            tripo_prompt = f"A single 3D printable solid model on a flat base, clean geometry, watertight mesh: {full_user_text[:250]}"
+            tripo_prompt = "A single 3D printable ergonomic object on a flat solid base, clean geometry, white clay model"
 
         use_tripo = bool(TRIPO_API_KEY) and (ai_data.get("mode") == "tripo" or not is_pure_simple_cad)
 
