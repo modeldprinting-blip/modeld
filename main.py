@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import math
@@ -55,7 +56,7 @@ SYSTEM_PROMPT = """
 
 Ако СЕ е јасно и физички возможно за печатење, одлучи кој генератор е подобар:
 - Користи `"mode": "tripo"` за СЕКОЈ уметнички, органски или детален објект: новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил!
-- Користи `"mode": "cad"` САМО за строга инженерска геометрија: прстен, чаша, кутија, држач, плочка, организатор, капак, цевка, конус.
+- Користи `"mode": "cad"` САМО за строга инженерска геометрија: прстен, чаша, кутија, држач, плочка, организатор, капак, цевка, конус, везови.
 
 Врати JSON:
 {
@@ -76,9 +77,9 @@ SYSTEM_PROMPT = """
   },
   "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid mesh, high detail: [детален опис на англиски]",
   "target_height_mm": 100.0,
-  "cad_script": "Целосен Python код со `trimesh`, `np` и `math` кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`."
+  "cad_script": "Кратко и чисто Python скриптче со `trimesh`, `np` и `math` кое креира објект `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`."
 }
-Врати САМО чист JSON без markdown ознаки.
+Одговори ИСКЛУЧИВО со валиден JSON објект, без никаков дополнителен текст пред или после него.
 """
 
 class ChatRequest(BaseModel):
@@ -102,6 +103,17 @@ def health_check():
         "tripo_enabled": bool(TRIPO_API_KEY)
     }
 
+def extract_json_object(text: str) -> dict:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start:end + 1]
+    return json.loads(cleaned)
+
 async def call_groq(history: list[dict]) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
@@ -112,20 +124,27 @@ async def call_groq(history: list[dict]) -> str:
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    groq_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    groq_models = [
+        "openai/gpt-oss-120b",
+        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+        "openai/gpt-oss-20b"
+    ]
     last_error = None
 
-    async with httpx.AsyncClient(timeout=30.0) as http:
+    async with httpx.AsyncClient(timeout=40.0) as http:
         for model_name in groq_models:
             payload = {
                 "model": model_name,
                 "messages": messages,
-                "response_format": {"type": "json_object"},
-                "temperature": 0.2
+                "temperature": 0.2,
+                "max_tokens": 4096
             }
             res = await http.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
             if res.status_code == 200:
-                return res.json()["choices"][0]["message"]["content"]
+                content = res.json()["choices"][0]["message"].get("content", "").strip()
+                if content:
+                    return content
             last_error = f"Groq HTTP {res.status_code} ({model_name}): {res.text}"
             print("GROQ RETRY:", last_error)
 
@@ -225,11 +244,9 @@ async def generate_3d(req: ChatRequest):
         return {"status": "needs_info", "message": f"AI грешка: {str(last_err)}"}
 
     try:
-        clean_json = raw_text.strip()
-        if clean_json.startswith("```"):
-            clean_json = clean_json.strip("`").replace("json\n", "", 1).strip()
-        ai_data = json.loads(clean_json)
+        ai_data = extract_json_object(raw_text)
     except Exception as e:
+        print("RAW AI TEXT:", raw_text)
         return {"status": "needs_info", "message": f"AI JSON грешка: {str(e)}"}
 
     if ai_data.get("status") == "needs_info":
