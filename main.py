@@ -9,6 +9,7 @@ import traceback
 import httpx
 import trimesh
 import numpy as np
+from groq import AsyncGroq
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +29,8 @@ app.mount("/models", StaticFiles(directory="generated_models"), name="models")
 
 GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
 TRIPO_API_KEY = (os.environ.get("TRIPO_API_KEY") or "").strip()
+
+groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 MATERIAL_PRICES_MKD_PER_G = {
     "PLA": 1.5,
@@ -116,33 +119,27 @@ async def call_groq(history: list[dict]) -> str:
         role = "assistant" if m.get("role") in ["assistant", "model", "ai"] else "user"
         messages.append({"role": role, "content": m.get("content", "")})
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
     groq_models = [
         "llama-3.3-70b-versatile",
         "openai/gpt-oss-120b",
-        "qwen/qwen3-32b",
-        "openai/gpt-oss-20b"
+        "llama-3.1-8b-instant"
     ]
     last_error = None
 
-    async with httpx.AsyncClient(timeout=40.0, trust_env=False) as http:
-        for model_name in groq_models:
-            payload = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": 4096
-            }
-            res = await http.post("[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)", headers=headers, json=payload)
-            if res.status_code == 200:
-                content = res.json()["choices"][0]["message"].get("content", "").strip()
-                if content:
-                    return content
-            last_error = f"Groq HTTP {res.status_code} ({model_name}): {res.text}"
-            print("GROQ RETRY:", last_error)
+    for model_name in groq_models:
+        try:
+            completion = await groq_client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=4096
+            )
+            content = (completion.choices[0].message.content or "").strip()
+            if content:
+                return content
+        except Exception as e:
+            last_error = f"{model_name}: {str(e)}"
+            print("GROQ MODEL RETRY:", last_error)
 
     raise RuntimeError(last_error)
 
@@ -151,7 +148,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         "Content-Type": "application/json",
         "Authorization": f"Bearer {TRIPO_API_KEY}"
     }
-    async with httpx.AsyncClient(timeout=120.0, trust_env=False) as http:
+    async with httpx.AsyncClient(timeout=120.0) as http:
         res = await http.post(
             "[https://api.tripo3d.ai/v2/openapi/task](https://api.tripo3d.ai/v2/openapi/task)",
             headers=headers,
@@ -206,7 +203,7 @@ def run_cad_script(cad_script: str):
 
 @app.post("/api/generate")
 async def generate_3d(req: ChatRequest):
-    if not GROQ_API_KEY:
+    if not groq_client:
         return {"status": "needs_info", "message": "Грешка: Нема поставено GROQ_API_KEY на серверот."}
 
     try:
@@ -342,4 +339,3 @@ async def create_order(order: OrderRequest):
     with open("orders_database.jsonl", "a", encoding="utf-8") as db:
         db.write(json.dumps(order_record, ensure_ascii=False) + "\n")
     return {"status": "confirmed", "message": "Нарачката е примена! Проверениот STL фајл е подготвен за 3D печатач."}
-    
