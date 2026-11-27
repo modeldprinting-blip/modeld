@@ -53,8 +53,8 @@ SYSTEM_PROMPT = """
 }
 
 Ако СЕ е јасно и физички возможно за печатење, одлучи кој генератор е подобар:
-- Користи `"mode": "tripo"` за СЕКОЈ уметнички, органски или детален објект: новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил!
-- Користи `"mode": "cad"` САМО за строга инженерска геометрија: прстен, чаша, кутија, држач, плочка, организатор, капак, цевка, конус, везови.
+- Користи `"mode": "tripo"` за СЕКОЈ сложен, анатомски, уметнички или детален објект: новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил, сноуборд везови (snowboard bindings), маска, рачка со ергономија, кацига!
+- Користи `"mode": "cad"` САМО за наједноставна геометрија од 1-2 форми: обичен прстен, цилиндар, кутија, рамна плочка, цевка, конус.
 
 Врати JSON со ТОЧНО овие имиња на полиња:
 {
@@ -73,7 +73,7 @@ SYSTEM_PROMPT = """
     "print_speed": "50 mm/s",
     "adhesion": "Skirt / Brim 5mm"
   },
-  "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid mesh, high detail: [детален опис на англиски]",
+  "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid watertight mesh, high detail: [детален опис на англиски]",
   "target_height_mm": 100.0,
   "cad_script": "Чист Python код со `trimesh`, `np` и `math` кој креира објект `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `.difference(...)` и `trimesh.util.concatenate([...])`."
 }
