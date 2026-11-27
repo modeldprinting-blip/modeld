@@ -39,6 +39,14 @@ MATERIAL_PRICES_MKD_PER_G = {
     "TPU": 2.6
 }
 
+TRIPO_KEYWORDS = [
+    "elka", "елка", "tree", "ukras", "украс", "figura", "фигура",
+    "zivotno", "животно", "statua", "статуа", "skulptura", "скулптура",
+    "igracka", "играчка", "vezovi", "везови", "snowboard", "сноуборд",
+    "maska", "маска", "kaciga", "кацига", "avtomobil", "автомобил",
+    "cvet", "цвет", "dragon", "змеј", "robot", "робот", "character"
+]
+
 SYSTEM_PROMPT = """
 Ти си главен 3D CAD инженер и консултант за 3D печатење на платформата Model D.
 Кога корисникот бара 3D модел, провери дали ги има следните информации:
@@ -57,8 +65,8 @@ SYSTEM_PROMPT = """
 - Користи `"mode": "cad"` САМО за наједноставна геометрија од 1-2 форми: обичен прстен, цилиндар, кутија, рамна плочка, цевка, конус.
 
 ВАЖНО:
-1. Во `tripo_prompt` НЕ ставај бројки и димензии во mm/cm (бидејќи Tripo AI генераторот не разбира димензии), туку пиши чист визуелен опис на англиски (пр. "A single 3D printable snowboard binding with flat baseplate, angled highback heel cup, side strap loops, solid watertight white clay model").
-2. СЕКОГАШ пополни го И `cad_script` со валиден Python код како резерва!
+1. Во `tripo_prompt` НЕ ставај бројки и димензии во mm/cm, туку пиши чист визуелен опис на англиски (пр. "A single 3D printable Christmas tree with layered branches and star on top on a flat circular base, solid watertight clay model").
+2. СЕКОГАШ пополни го И `tripo_prompt` И `cad_script` (во `cad_script` користи ИСКЛУЧИВО `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone`, `trimesh.creation.icosphere`, `.apply_translation(...)`, `.difference(...)` и `trimesh.util.concatenate([...])` — НИКОГАШ `.buffer()`!).
 
 Врати JSON со ТОЧНО овие имиња на полиња:
 {
@@ -79,7 +87,7 @@ SYSTEM_PROMPT = """
   },
   "tripo_prompt": "A single 3D printable solid object on a flat base, clean geometry, no floating parts, untextured clay render: [опис на англиски без бројки]",
   "target_height_mm": 100.0,
-  "cad_script": "Чист Python код со `trimesh`, `np` и `math` кој креира објект `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `.difference(...)` и `trimesh.util.concatenate([...])`."
+  "cad_script": "Чист Python код со `trimesh`, `np` и `math` кој креира `final_mesh` во милиметри."
 }
 Одговори ИСКЛУЧИВО со валиден JSON објект, без никаков дополнителен текст пред или после него.
 """
@@ -241,9 +249,16 @@ async def generate_3d(req: ChatRequest):
     try:
         final_mesh = None
         tripo_error_msg = None
-        tripo_prompt = (ai_data.get("tripo_prompt") or ai_data.get("prompt") or "").strip()
+        full_user_text = " ".join([m.get("content", "").lower() for m in req.history if m.get("role") == "user"])
+        force_tripo = any(kw in full_user_text for kw in TRIPO_KEYWORDS)
 
-        if ai_data.get("mode") == "tripo" and TRIPO_API_KEY and tripo_prompt:
+        tripo_prompt = (ai_data.get("tripo_prompt") or ai_data.get("prompt") or "").strip()
+        if not tripo_prompt and force_tripo:
+            tripo_prompt = f"A single 3D printable solid model on a flat base, clean geometry, watertight mesh: {full_user_text[:250]}"
+
+        use_tripo = (ai_data.get("mode") == "tripo" or force_tripo) and bool(TRIPO_API_KEY) and bool(tripo_prompt)
+
+        if use_tripo:
             try:
                 final_mesh = await generate_with_tripo(
                     tripo_prompt,
@@ -269,9 +284,16 @@ async def generate_3d(req: ChatRequest):
                     final_mesh = run_cad_script(script_code)
                 except Exception as cad_err:
                     print("CAD ERROR:", traceback.format_exc())
-                    if tripo_error_msg:
+                    if TRIPO_API_KEY and tripo_prompt and not use_tripo:
+                        final_mesh = await generate_with_tripo(
+                            tripo_prompt,
+                            verified_stl_path,
+                            float(ai_data.get("target_height_mm") or 80.0)
+                        )
+                    elif tripo_error_msg:
                         raise RuntimeError(f"Tripo: {tripo_error_msg} | CAD: {str(cad_err)}")
-                    raise cad_err
+                    else:
+                        raise cad_err
             elif tripo_error_msg:
                 raise RuntimeError(tripo_error_msg)
             else:
