@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 httpx
+groq
 trimesh
 numpy
 scipy
