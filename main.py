@@ -39,12 +39,10 @@ MATERIAL_PRICES_MKD_PER_G = {
     "TPU": 2.6
 }
 
-TRIPO_KEYWORDS = [
-    "elka", "елка", "tree", "ukras", "украс", "figura", "фигура",
-    "zivotno", "животно", "statua", "статуа", "skulptura", "скулптура",
-    "igracka", "играчка", "vezovi", "везови", "snowboard", "сноуборд",
-    "maska", "маска", "kaciga", "кацига", "avtomobil", "автомобил",
-    "cvet", "цвет", "dragon", "змеј", "robot", "робот", "character"
+PURE_CAD_KEYWORDS = [
+    "kocka", "коцка", "kvadar", "квадар", "prsten", "прстен",
+    "cilindar", "цилиндар", "plocka", "плочка", "cevka", "цевка",
+    "konus", "конус", "podloska", "подлошка", "kapak", "капак"
 ]
 
 SYSTEM_PROMPT = """
@@ -61,12 +59,13 @@ SYSTEM_PROMPT = """
 }
 
 Ако СЕ е јасно и физички возможно за печатење, одлучи кој генератор е подобар:
-- Користи `"mode": "tripo"` за СЕКОЈ сложен, анатомски, уметнички или детален објект: новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил, сноуборд везови (snowboard bindings), маска, рачка со ергономија, кацига!
-- Користи `"mode": "cad"` САМО за наједноставна геометрија од 1-2 форми: обичен прстен, цилиндар, кутија, рамна плочка, цевка, конус.
+- Користи `"mode": "tripo"` за 95% од предметите: СЕКОЈ реален, ергономски, уметнички, органски или детален објект (новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил, сноуборд везови / snowboard bindings, маска, рачка, кацига, држач за телефон, вазна, чаша со релјеф, резервен дел со сложен облик).
+- Користи `"mode": "cad"` ИСКЛУЧИВО за наједноставна геометрија од 1 форма: обичен прстен, цилиндар, коцка, рамна плочка, цевка, конус.
 
 ВАЖНО:
 1. Во `tripo_prompt` НЕ ставај бројки и димензии во mm/cm, туку пиши чист визуелен опис на англиски (пр. "A single 3D printable Christmas tree with layered branches and star on top on a flat circular base, solid watertight clay model").
 2. Во `cad_script` напиши ИСКЛУЧИВО валиден Python код со `trimesh` кој ја дефинира променливата `final_mesh` (НИКОГАШ OpenSCAD код, НИКОГАШ `.buffer()`).
+3. Во `target_height_mm` стави ја висината во милиметри (ако корисникот дал cm, помножи со 10; минимум 15.0, максимум 220.0).
 
 Врати JSON со ТОЧНО овие имиња на полиња:
 {
@@ -85,7 +84,7 @@ SYSTEM_PROMPT = """
     "print_speed": "50 mm/s",
     "adhesion": "Skirt / Brim 5mm"
   },
-  "tripo_prompt": "A single 3D printable solid object on a flat base, clean geometry, no floating parts, untextured clay render: [опис на англиски без бројки]",
+  "tripo_prompt": "A single 3D printable solid object on a flat base, clean geometry, no floating parts, untextured clay render: [детален опис на англиски без бројки]",
   "target_height_mm": 100.0,
   "cad_script": "final_mesh = trimesh.creation.cone(radius=25.0, height=100.0)"
 }
@@ -173,7 +172,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         task_id = res_data["data"]["task_id"]
 
         model_url = None
-        for _ in range(50):
+        for _ in range(55):
             await asyncio.sleep(2)
             status_res = await http.get(f"[https://api.tripo3d.ai/v2/openapi/task/](https://api.tripo3d.ai/v2/openapi/task/){task_id}", headers=headers)
             s_data = status_res.json().get("data", {})
@@ -201,8 +200,15 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         loaded.apply_transform(rot_x)
 
         current_height = loaded.extents[2] if loaded.extents[2] > 0 else 1.0
-        scale_factor = max(target_height_mm, 10.0) / current_height
+        clamped_height = min(max(target_height_mm, 15.0), 220.0)
+        scale_factor = clamped_height / current_height
         loaded.apply_scale(scale_factor)
+
+        # Заштита да не ги надмине димензиите на 3D печатачот по X или Y
+        max_xy = max(loaded.extents[0], loaded.extents[1])
+        if max_xy > 230.0:
+            loaded.apply_scale(230.0 / max_xy)
+
         return loaded
 
 def run_cad_script(cad_script: str):
@@ -248,15 +254,14 @@ async def generate_3d(req: ChatRequest):
 
     try:
         final_mesh = None
-        tripo_error_msg = None
         full_user_text = " ".join([m.get("content", "").lower() for m in req.history if m.get("role") == "user"])
-        force_tripo = any(kw in full_user_text for kw in TRIPO_KEYWORDS)
+        is_pure_simple_cad = any(kw in full_user_text for kw in PURE_CAD_KEYWORDS) and len(full_user_text) < 90
 
         tripo_prompt = (ai_data.get("tripo_prompt") or ai_data.get("prompt") or "").strip()
-        if not tripo_prompt and force_tripo:
+        if not tripo_prompt:
             tripo_prompt = f"A single 3D printable solid model on a flat base, clean geometry, watertight mesh: {full_user_text[:250]}"
 
-        use_tripo = (ai_data.get("mode") == "tripo" or force_tripo) and bool(TRIPO_API_KEY) and bool(tripo_prompt)
+        use_tripo = bool(TRIPO_API_KEY) and (ai_data.get("mode") == "tripo" or not is_pure_simple_cad)
 
         if use_tripo:
             try:
@@ -266,8 +271,7 @@ async def generate_3d(req: ChatRequest):
                     float(ai_data.get("target_height_mm") or 80.0)
                 )
             except Exception as tripo_err:
-                tripo_error_msg = str(tripo_err)
-                print("TRIPO ERROR:", traceback.format_exc())
+                print("TRIPO FALLBACK:", traceback.format_exc())
 
         if final_mesh is None:
             script_code = (
@@ -281,20 +285,21 @@ async def generate_3d(req: ChatRequest):
             if script_code:
                 try:
                     final_mesh = run_cad_script(script_code)
-                except Exception as cad_err:
-                    print("CAD ERROR:", traceback.format_exc())
-                    if TRIPO_API_KEY and tripo_prompt and not use_tripo:
-                        try:
-                            final_mesh = await generate_with_tripo(
-                                tripo_prompt,
-                                verified_stl_path,
-                                float(ai_data.get("target_height_mm") or 80.0)
-                            )
-                        except Exception:
-                            pass
+                except Exception:
+                    print("CAD FALLBACK:", traceback.format_exc())
+
+            if final_mesh is None and TRIPO_API_KEY and not use_tripo:
+                try:
+                    final_mesh = await generate_with_tripo(
+                        tripo_prompt,
+                        verified_stl_path,
+                        float(ai_data.get("target_height_mm") or 80.0)
+                    )
+                except Exception:
+                    print("SECOND TRIPO FALLBACK:", traceback.format_exc())
 
             if final_mesh is None:
-                h = float(ai_data.get("target_height_mm") or 60.0)
+                h = min(max(float(ai_data.get("target_height_mm") or 60.0), 15.0), 200.0)
                 if "konus" in full_user_text or "конус" in full_user_text or "elka" in full_user_text or "елка" in full_user_text:
                     final_mesh = trimesh.creation.cone(radius=h * 0.35, height=h)
                 elif "cilindar" in full_user_text or "цилиндар" in full_user_text or "casa" in full_user_text or "чаша" in full_user_text:
@@ -304,6 +309,9 @@ async def generate_3d(req: ChatRequest):
 
         if isinstance(final_mesh, trimesh.Scene):
             final_mesh = trimesh.util.concatenate(tuple(final_mesh.geometry.values()))
+
+        if len(final_mesh.vertices) == 0 or max(final_mesh.extents) <= 0.1:
+            final_mesh = trimesh.creation.box(extents=[50.0, 50.0, 20.0])
 
         try:
             trimesh.repair.fill_holes(final_mesh)
