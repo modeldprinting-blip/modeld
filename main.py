@@ -94,7 +94,7 @@ async def call_groq(history: list[dict]) -> str:
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    groq_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
+    groq_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
     last_error = None
 
     async with httpx.AsyncClient(timeout=30.0) as http:
@@ -162,7 +162,6 @@ async def generate_3d(req: ChatRequest):
     raw_text = None
     last_err = None
 
-    # 1. Примарен провајдер: Groq
     if GROQ_API_KEY:
         try:
             raw_text = await call_groq(req.history)
@@ -170,7 +169,6 @@ async def generate_3d(req: ChatRequest):
             last_err = e
             print("GROQ ERROR:", str(e))
 
-    # 2. Резервен провајдер: Gemini
     if raw_text is None and gemini_client:
         conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
         for m_name in ["gemini-3.8-flash", "gemini-3.8-flash-lite"]:
