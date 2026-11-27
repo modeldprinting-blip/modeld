@@ -56,6 +56,10 @@ SYSTEM_PROMPT = """
 - Користи `"mode": "tripo"` за СЕКОЈ сложен, анатомски, уметнички или детален објект: новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил, сноуборд везови (snowboard bindings), маска, рачка со ергономија, кацига!
 - Користи `"mode": "cad"` САМО за наједноставна геометрија од 1-2 форми: обичен прстен, цилиндар, кутија, рамна плочка, цевка, конус.
 
+ВАЖНО:
+1. Во `tripo_prompt` НЕ ставај бројки и димензии во mm/cm (бидејќи Tripo AI генераторот не разбира димензии), туку пиши чист визуелен опис на англиски (пр. "A single 3D printable snowboard binding with flat baseplate, angled highback heel cup, side strap loops, solid watertight white clay model").
+2. СЕКОГАШ пополни го И `cad_script` со валиден Python код како резерва!
+
 Врати JSON со ТОЧНО овие имиња на полиња:
 {
   "status": "ready",
@@ -73,7 +77,7 @@ SYSTEM_PROMPT = """
     "print_speed": "50 mm/s",
     "adhesion": "Skirt / Brim 5mm"
   },
-  "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid watertight mesh, high detail: [детален опис на англиски]",
+  "tripo_prompt": "A single 3D printable solid object on a flat base, clean geometry, no floating parts, untextured clay render: [опис на англиски без бројки]",
   "target_height_mm": 100.0,
   "cad_script": "Чист Python код со `trimesh`, `np` и `math` кој креира објект `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `.difference(...)` и `trimesh.util.concatenate([...])`."
 }
@@ -144,6 +148,7 @@ async def call_groq(history: list[dict]) -> str:
     raise RuntimeError(last_error)
 
 async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_mm: float):
+    clean_prompt = str(prompt).strip()[:450]
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {TRIPO_API_KEY}"
@@ -152,26 +157,28 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         res = await http.post(
             "[https://api.tripo3d.ai/v2/openapi/task](https://api.tripo3d.ai/v2/openapi/task)",
             headers=headers,
-            json={"type": "text_to_model", "prompt": prompt}
+            json={"type": "text_to_model", "prompt": clean_prompt}
         )
         res_data = res.json()
         if res_data.get("code") != 0:
-            raise RuntimeError(f"Tripo Error: {res_data}")
+            raise RuntimeError(f"Tripo API одби ({res_data.get('code')}): {res_data.get('message')}")
         task_id = res_data["data"]["task_id"]
 
         model_url = None
-        for _ in range(45):
+        for _ in range(50):
             await asyncio.sleep(2)
             status_res = await http.get(f"[https://api.tripo3d.ai/v2/openapi/task/](https://api.tripo3d.ai/v2/openapi/task/){task_id}", headers=headers)
-            s_data = status_res.json()["data"]
-            if s_data["status"] == "success":
-                model_url = s_data["output"].get("model") or s_data["output"].get("pbr_model")
+            s_data = status_res.json().get("data", {})
+            st = s_data.get("status")
+            if st == "success":
+                out = s_data.get("output", {})
+                model_url = out.get("model") or out.get("pbr_model") or out.get("base_model")
                 break
-            elif s_data["status"] in ["failed", "cancelled"]:
-                raise RuntimeError("Tripo 3D генерацијата не успеа.")
+            elif st in ["failed", "cancelled", "banned"]:
+                raise RuntimeError(f"Tripo статус: {st}")
 
         if not model_url:
-            raise RuntimeError("Tripo 3D истече времето.")
+            raise RuntimeError("Tripo истече времето (timeout).")
 
         glb_path = output_stl_path.replace(".stl", ".glb")
         glb_bytes = (await http.get(model_url)).content
@@ -186,7 +193,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         loaded.apply_transform(rot_x)
 
         current_height = loaded.extents[2] if loaded.extents[2] > 0 else 1.0
-        scale_factor = target_height_mm / current_height
+        scale_factor = max(target_height_mm, 10.0) / current_height
         loaded.apply_scale(scale_factor)
         return loaded
 
@@ -233,16 +240,19 @@ async def generate_3d(req: ChatRequest):
 
     try:
         final_mesh = None
-        tripo_prompt = ai_data.get("tripo_prompt") or ai_data.get("prompt")
+        tripo_error_msg = None
+        tripo_prompt = (ai_data.get("tripo_prompt") or ai_data.get("prompt") or "").strip()
+
         if ai_data.get("mode") == "tripo" and TRIPO_API_KEY and tripo_prompt:
             try:
                 final_mesh = await generate_with_tripo(
                     tripo_prompt,
                     verified_stl_path,
-                    float(ai_data.get("target_height_mm", 80.0))
+                    float(ai_data.get("target_height_mm") or 80.0)
                 )
             except Exception as tripo_err:
-                print("TRIPO FALLBACK TO CAD:", str(tripo_err))
+                tripo_error_msg = str(tripo_err)
+                print("TRIPO ERROR:", traceback.format_exc())
 
         if final_mesh is None:
             script_code = (
@@ -251,10 +261,22 @@ async def generate_3d(req: ChatRequest):
                 or ai_data.get("script")
                 or ai_data.get("code")
                 or ai_data.get("python_code")
-            )
-            if not script_code:
-                raise RuntimeError(f"AI не испрати CAD код (клучеви: {list(ai_data.keys())})")
-            final_mesh = run_cad_script(script_code)
+                or ""
+            ).strip()
+
+            if script_code:
+                try:
+                    final_mesh = run_cad_script(script_code)
+                except Exception as cad_err:
+                    print("CAD ERROR:", traceback.format_exc())
+                    if tripo_error_msg:
+                        raise RuntimeError(f"Tripo: {tripo_error_msg} | CAD: {str(cad_err)}")
+                    raise cad_err
+            elif tripo_error_msg:
+                raise RuntimeError(tripo_error_msg)
+            else:
+                h = float(ai_data.get("target_height_mm") or 50.0)
+                final_mesh = trimesh.creation.box(extents=[h, h * 0.6, max(h * 0.2, 5.0)])
 
         if isinstance(final_mesh, trimesh.Scene):
             final_mesh = trimesh.util.concatenate(tuple(final_mesh.geometry.values()))
