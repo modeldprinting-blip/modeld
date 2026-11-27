@@ -26,10 +26,11 @@ app.add_middleware(
 os.makedirs("generated_models", exist_ok=True)
 app.mount("/models", StaticFiles(directory="generated_models"), name="models")
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TRIPO_API_KEY = os.environ.get("TRIPO_API_KEY")
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 MATERIAL_PRICES_MKD_PER_G = {
     "PLA": 1.5,
@@ -83,6 +84,28 @@ class OrderRequest(BaseModel):
 def health_check():
     return {"status": "online", "service": "Model D Backend"}
 
+async def call_groq(history: list[dict]) -> str:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for m in history:
+        role = "assistant" if m.get("role") in ["assistant", "model", "ai"] else "user"
+        messages.append({"role": role, "content": m.get("content", "")})
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2
+    }
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        res = await http.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+        if res.status_code != 200:
+            raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text}")
+        return res.json()["choices"][0]["message"]["content"]
+
 async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_mm: float):
     headers = {
         "Content-Type": "application/json",
@@ -126,19 +149,26 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
 
 @app.post("/api/generate")
 async def generate_3d(req: ChatRequest):
-    if not client:
-        return {"status": "needs_info", "message": "Грешка: GEMINI_API_KEY не е поставен на серверот."}
+    if not GROQ_API_KEY and not gemini_client:
+        return {"status": "needs_info", "message": "Грешка: Нема поставено GROQ_API_KEY или GEMINI_API_KEY на серверот."}
 
-    conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
-
-    models_to_try = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"]
-    response = None
+    raw_text = None
     last_err = None
 
-    for m_name in models_to_try:
-        for attempt in range(2):
+    # 1. Примарен провајдер: Groq (ултра-брз, без 503 преоптоварување)
+    if GROQ_API_KEY:
+        try:
+            raw_text = await call_groq(req.history)
+        except Exception as e:
+            last_err = e
+            print("GROQ ERROR:", str(e))
+
+    # 2. Резервен провајдер: Gemini (ако Groq не е поставен или падне)
+    if raw_text is None and gemini_client:
+        conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
+        for m_name in ["gemini-3.8-flash", "gemini-3.8-flash-lite"]:
             try:
-                response = client.models.generate_content(
+                response = gemini_client.models.generate_content(
                     model=m_name,
                     contents=conversation_text,
                     config=types.GenerateContentConfig(
@@ -146,24 +176,22 @@ async def generate_3d(req: ChatRequest):
                         response_mime_type="application/json"
                     )
                 )
+                raw_text = response.text.strip()
                 break
             except Exception as e:
                 last_err = e
-                await asyncio.sleep(1.5)
-        if response is not None:
-            break
 
-    if response is None:
+    if raw_text is None:
         return {
             "status": "needs_info",
-            "message": "AI серверот на Google е моментално преоптоварен (503). Почекај 5 секунди и кликни Прати повторно."
+            "message": f"AI грешка: {str(last_err)}"
         }
 
     try:
-        raw_text = response.text.strip()
-        if raw_text.startswith("```"):
-            raw_text = raw_text.strip("`").replace("json\n", "", 1).strip()
-        ai_data = json.loads(raw_text)
+        clean_json = raw_text.strip()
+        if clean_json.startswith("```"):
+            clean_json = clean_json.strip("`").replace("json\n", "", 1).strip()
+        ai_data = json.loads(clean_json)
     except Exception as e:
         return {"status": "needs_info", "message": f"AI JSON грешка: {str(e)}"}
 
