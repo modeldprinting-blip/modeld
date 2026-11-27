@@ -140,7 +140,7 @@ async def call_groq(history: list[dict]) -> str:
                 "temperature": 0.2,
                 "max_tokens": 4096
             }
-            res = await http.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+            res = await http.post("[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)", headers=headers, json=payload)
             if res.status_code == 200:
                 content = res.json()["choices"][0]["message"].get("content", "").strip()
                 if content:
@@ -157,7 +157,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
     }
     async with httpx.AsyncClient(timeout=120.0) as http:
         res = await http.post(
-            "https://api.tripo3d.ai/v2/openapi/task",
+            "[https://api.tripo3d.ai/v2/openapi/task](https://api.tripo3d.ai/v2/openapi/task)",
             headers=headers,
             json={"type": "text_to_model", "prompt": prompt}
         )
@@ -169,7 +169,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         model_url = None
         for _ in range(45):
             await asyncio.sleep(2)
-            status_res = await http.get(f"https://api.tripo3d.ai/v2/openapi/task/{task_id}", headers=headers)
+            status_res = await http.get(f"[https://api.tripo3d.ai/v2/openapi/task/](https://api.tripo3d.ai/v2/openapi/task/){task_id}", headers=headers)
             s_data = status_res.json()["data"]
             if s_data["status"] == "success":
                 model_url = s_data["output"].get("model") or s_data["output"].get("pbr_model")
@@ -369,4 +369,4 @@ async def create_order(order: OrderRequest):
     order_record["verified_file"] = f"generated_models/{order.model_id}_verified.stl"
     with open("orders_database.jsonl", "a", encoding="utf-8") as db:
         db.write(json.dumps(order_record, ensure_ascii=False) + "\n")
-    return {"status": "confirmed", "message": "Нарачката е примена! Проверениот STL фајл е подготвен за 3D печатач."} 
+    return {"status": "confirmed", "message": "Нарачката е примена! Проверениот STL фајл е подготвен за 3D печатач."}
