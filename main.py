@@ -28,9 +28,9 @@ app.add_middleware(
 os.makedirs("generated_models", exist_ok=True)
 app.mount("/models", StaticFiles(directory="generated_models"), name="models")
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-TRIPO_API_KEY = os.environ.get("TRIPO_API_KEY")
+GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
+TRIPO_API_KEY = (os.environ.get("TRIPO_API_KEY") or "").strip()
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
@@ -100,7 +100,9 @@ def health_check():
     return {
         "status": "online",
         "service": "Model D Backend",
-        "tripo_enabled": bool(TRIPO_API_KEY)
+        "tripo_enabled": bool(TRIPO_API_KEY),
+        "groq_enabled": bool(GROQ_API_KEY),
+        "gemini_enabled": bool(GEMINI_API_KEY)
     }
 
 def extract_json_object(text: str) -> dict:
@@ -132,7 +134,7 @@ async def call_groq(history: list[dict]) -> str:
     ]
     last_error = None
 
-    async with httpx.AsyncClient(timeout=40.0) as http:
+    async with httpx.AsyncClient(timeout=40.0, trust_env=False) as http:
         for model_name in groq_models:
             payload = {
                 "model": model_name,
@@ -155,7 +157,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         "Content-Type": "application/json",
         "Authorization": f"Bearer {TRIPO_API_KEY}"
     }
-    async with httpx.AsyncClient(timeout=120.0) as http:
+    async with httpx.AsyncClient(timeout=120.0, trust_env=False) as http:
         res = await http.post(
             "[https://api.tripo3d.ai/v2/openapi/task](https://api.tripo3d.ai/v2/openapi/task)",
             headers=headers,
@@ -221,7 +223,7 @@ async def generate_3d(req: ChatRequest):
             raw_text = await call_groq(req.history)
         except Exception as e:
             last_err = e
-            print("GROQ ERROR:", str(e))
+            print("GROQ ERROR:", traceback.format_exc())
 
     if raw_text is None and gemini_client:
         conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
