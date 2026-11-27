@@ -249,17 +249,30 @@ async def generate_3d(req: ChatRequest):
             raise RuntimeError(f"PrusaSlicer error: {proc.stderr or proc.stdout}")
 
         grams_used = 0.0
-        print_time_str = "0m"
+        print_time_str = ""
         with open(gcode_path, "r") as f:
-            for line in f.readlines()[-60:]:
+            for line in f.readlines()[-100:]:
                 if "filament used [g]" in line:
-                    grams_used = float(line.split("=")[1].strip())
+                    try:
+                        grams_used = float(line.split("=")[1].strip())
+                    except Exception:
+                        pass
                 if "estimated printing time (normal mode)" in line:
                     print_time_str = line.split("=")[1].strip()
 
+        # Резервна физичка пресметка од волумен (mm3 -> cm3 -> g) ако PrusaSlicer врати 0
+        if grams_used <= 0.1:
+            vol_cm3 = abs(float(final_mesh.volume)) / 1000.0
+            grams_used = max(round(vol_cm3 * 1.24 * 0.45, 1), 1.5)
+
+        if not print_time_str:
+            est_mins = max(int(grams_used * 3.5), 12)
+            hrs, mins = divmod(est_mins, 60)
+            print_time_str = f"{hrs}h {mins}m" if hrs > 0 else f"{mins}m"
+
         rec_mat = ai_data.get("recommended_material", "PLA")
-        material_cost = grams_used * MATERIAL_PRICES_MKD_PER_G.get(rec_mat, 1.5)
-        selling_price = round(material_cost * 3, 0)
+        material_cost = max(round(grams_used * MATERIAL_PRICES_MKD_PER_G.get(rec_mat, 1.5), 0), 10)
+        selling_price = max(round(material_cost * 3, 0), 150)
 
         default_slicer = {
             "layer_height": "0.20 mm",
@@ -284,7 +297,7 @@ async def generate_3d(req: ChatRequest):
             "stats": {
                 "grams": round(grams_used, 1),
                 "print_time": print_time_str,
-                "material_cost_mkd": round(material_cost, 0),
+                "material_cost_mkd": material_cost,
                 "selling_price_mkd": selling_price,
                 "is_watertight": bool(final_mesh.is_watertight),
                 "dimensions_mm": [round(x, 1) for x in final_mesh.extents]
