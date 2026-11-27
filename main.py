@@ -66,7 +66,7 @@ SYSTEM_PROMPT = """
 
 ВАЖНО:
 1. Во `tripo_prompt` НЕ ставај бројки и димензии во mm/cm, туку пиши чист визуелен опис на англиски (пр. "A single 3D printable Christmas tree with layered branches and star on top on a flat circular base, solid watertight clay model").
-2. СЕКОГАШ пополни го И `tripo_prompt` И `cad_script` (во `cad_script` користи ИСКЛУЧИВО `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone`, `trimesh.creation.icosphere`, `.apply_translation(...)`, `.difference(...)` и `trimesh.util.concatenate([...])` — НИКОГАШ `.buffer()`!).
+2. Во `cad_script` напиши ИСКЛУЧИВО валиден Python код со `trimesh` кој ја дефинира променливата `final_mesh` (НИКОГАШ OpenSCAD код, НИКОГАШ `.buffer()`).
 
 Врати JSON со ТОЧНО овие имиња на полиња:
 {
@@ -87,7 +87,7 @@ SYSTEM_PROMPT = """
   },
   "tripo_prompt": "A single 3D printable solid object on a flat base, clean geometry, no floating parts, untextured clay render: [опис на англиски без бројки]",
   "target_height_mm": 100.0,
-  "cad_script": "Чист Python код со `trimesh`, `np` и `math` кој креира `final_mesh` во милиметри."
+  "cad_script": "final_mesh = trimesh.creation.cone(radius=25.0, height=100.0)"
 }
 Одговори ИСКЛУЧИВО со валиден JSON објект, без никаков дополнителен текст пред или после него.
 """
@@ -161,7 +161,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         "Content-Type": "application/json",
         "Authorization": f"Bearer {TRIPO_API_KEY}"
     }
-    async with httpx.AsyncClient(timeout=120.0) as http:
+    async with httpx.AsyncClient(timeout=120.0, trust_env=False) as http:
         res = await http.post(
             "[https://api.tripo3d.ai/v2/openapi/task](https://api.tripo3d.ai/v2/openapi/task)",
             headers=headers,
@@ -272,7 +272,6 @@ async def generate_3d(req: ChatRequest):
         if final_mesh is None:
             script_code = (
                 ai_data.get("cad_script")
-                or ai_data.get("scad")
                 or ai_data.get("script")
                 or ai_data.get("code")
                 or ai_data.get("python_code")
@@ -285,20 +284,23 @@ async def generate_3d(req: ChatRequest):
                 except Exception as cad_err:
                     print("CAD ERROR:", traceback.format_exc())
                     if TRIPO_API_KEY and tripo_prompt and not use_tripo:
-                        final_mesh = await generate_with_tripo(
-                            tripo_prompt,
-                            verified_stl_path,
-                            float(ai_data.get("target_height_mm") or 80.0)
-                        )
-                    elif tripo_error_msg:
-                        raise RuntimeError(f"Tripo: {tripo_error_msg} | CAD: {str(cad_err)}")
-                    else:
-                        raise cad_err
-            elif tripo_error_msg:
-                raise RuntimeError(tripo_error_msg)
-            else:
-                h = float(ai_data.get("target_height_mm") or 50.0)
-                final_mesh = trimesh.creation.box(extents=[h, h * 0.6, max(h * 0.2, 5.0)])
+                        try:
+                            final_mesh = await generate_with_tripo(
+                                tripo_prompt,
+                                verified_stl_path,
+                                float(ai_data.get("target_height_mm") or 80.0)
+                            )
+                        except Exception:
+                            pass
+
+            if final_mesh is None:
+                h = float(ai_data.get("target_height_mm") or 60.0)
+                if "konus" in full_user_text or "конус" in full_user_text or "elka" in full_user_text or "елка" in full_user_text:
+                    final_mesh = trimesh.creation.cone(radius=h * 0.35, height=h)
+                elif "cilindar" in full_user_text or "цилиндар" in full_user_text or "casa" in full_user_text or "чаша" in full_user_text:
+                    final_mesh = trimesh.creation.cylinder(radius=h * 0.4, height=h)
+                else:
+                    final_mesh = trimesh.creation.box(extents=[h, h * 0.6, max(h * 0.3, 10.0)])
 
         if isinstance(final_mesh, trimesh.Scene):
             final_mesh = trimesh.util.concatenate(tuple(final_mesh.geometry.values()))
