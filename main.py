@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import math
 import asyncio
 import subprocess
 import traceback
@@ -54,7 +55,7 @@ SYSTEM_PROMPT = """
 
 Ако СЕ е јасно и физички возможно за печатење, одлучи кој генератор е подобар:
 - Користи `"mode": "tripo"` за СЕКОЈ уметнички, органски или детален објект: новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил!
-- Користи `"mode": "cad"` САМО за строга инженерска геометрија: прстен, чаша, кутија, држач, плочка, организатор, капак, цевка.
+- Користи `"mode": "cad"` САМО за строга инженерска геометрија: прстен, чаша, кутија, држач, плочка, организатор, капак, цевка, конус.
 
 Врати JSON:
 {
@@ -75,7 +76,7 @@ SYSTEM_PROMPT = """
   },
   "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid mesh, high detail: [опис на англиски]",
   "target_height_mm": 100.0,
-  "cad_script": "Целосен Python код со библиотеката `trimesh` (и `np`) кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm (ако mode е cad). Користи исклучиво `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone`, `trimesh.creation.capsule`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`."
+  "cad_script": "Целосен Python код со `trimesh`, `np` и `math` кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`."
 }
 Врати САМО чист JSON без markdown ознаки.
 """
@@ -95,7 +96,11 @@ class OrderRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "Model D Backend"}
+    return {
+        "status": "online",
+        "service": "Model D Backend",
+        "tripo_enabled": bool(TRIPO_API_KEY)
+    }
 
 async def call_groq(history: list[dict]) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -165,7 +170,6 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         if isinstance(loaded, trimesh.Scene):
             loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
 
-        # Tripo GLB користи Y-up; ротираме во Z-up за 3D печатење
         rot_x = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
         loaded.apply_transform(rot_x)
 
@@ -233,9 +237,15 @@ async def generate_3d(req: ChatRequest):
                 float(ai_data.get("target_height_mm", 80.0))
             )
         else:
-            local_env = {"trimesh": trimesh, "np": np}
-            exec(ai_data["cad_script"], {}, local_env)
-            final_mesh = local_env["final_mesh"]
+            exec_globals = {
+                "__builtins__": __builtins__,
+                "trimesh": trimesh,
+                "np": np,
+                "numpy": np,
+                "math": math
+            }
+            exec(ai_data["cad_script"], exec_globals)
+            final_mesh = exec_globals["final_mesh"]
 
         if isinstance(final_mesh, trimesh.Scene):
             final_mesh = trimesh.util.concatenate(tuple(final_mesh.geometry.values()))
