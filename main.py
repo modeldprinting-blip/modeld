@@ -53,14 +53,14 @@ SYSTEM_PROMPT = """
 }
 
 Ако СЕ е јасно и физички возможно за печатење, одлучи кој генератор е подобар:
-- Користи `"mode": "cad"` за геометриски/функционални делови (чаша, кутија, држач, прстен, цилиндар, плочка, организатор, капак).
-- Користи `"mode": "tripo"` за сложени/органски форми (фигура, животно, скулптура, статуа, сложен уметнички објект).
+- Користи `"mode": "tripo"` за СЕКОЈ уметнички, органски или детален објект: новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил!
+- Користи `"mode": "cad"` САМО за строга инженерска геометрија: прстен, чаша, кутија, држач, плочка, организатор, капак, цевка.
 
 Врати JSON:
 {
   "status": "ready",
   "mode": "cad" | "tripo",
-  "message": "Потврда на македонски дека моделот е физички проверен, поправен (Watertight) и исечен во PrusaSlicer.",
+  "message": "Потврда на македонски дека моделот е физички проверен, поправен (Watertight) и подготвен за 3D печатење.",
   "recommended_material": "PLA" | "PETG" | "ABS" | "TPU",
   "material_reason": "Објаснување на македонски зошто оваа пластика е најдобра за намената.",
   "slicer_settings": {
@@ -73,9 +73,9 @@ SYSTEM_PROMPT = """
     "print_speed": "50 mm/s",
     "adhesion": "Skirt / Brim 5mm"
   },
-  "tripo_prompt": "Детален опис на англиски за 3D моделот (ако mode е tripo), без позадина, solid 3d printable object",
-  "target_height_mm": 80.0,
-  "cad_script": "Целосен Python код со библиотеката `trimesh` (и `np`) кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm (ако mode е cad). Користи исклучиво `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.capsule`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`! Не користи boolean difference/intersection за да нема потреба од надворешни библиотеки."
+  "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid mesh, high detail: [опис на англиски]",
+  "target_height_mm": 100.0,
+  "cad_script": "Целосен Python код со библиотеката `trimesh` (и `np`) кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm (ако mode е cad). Користи исклучиво `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone`, `trimesh.creation.capsule`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`."
 }
 Врати САМО чист JSON без markdown ознаки.
 """
@@ -162,6 +162,13 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
             f.write(glb_bytes)
 
         loaded = trimesh.load(glb_path, force="mesh")
+        if isinstance(loaded, trimesh.Scene):
+            loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+
+        # Tripo GLB користи Y-up; ротираме во Z-up за 3D печатење
+        rot_x = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
+        loaded.apply_transform(rot_x)
+
         current_height = loaded.extents[2] if loaded.extents[2] > 0 else 1.0
         scale_factor = target_height_mm / current_height
         loaded.apply_scale(scale_factor)
@@ -214,6 +221,7 @@ async def generate_3d(req: ChatRequest):
         return ai_data
 
     model_id = str(uuid.uuid4())[:8]
+    os.makedirs("generated_models", exist_ok=True)
     verified_stl_path = f"generated_models/{model_id}_verified.stl"
     gcode_path = f"generated_models/{model_id}.gcode"
 
@@ -229,14 +237,22 @@ async def generate_3d(req: ChatRequest):
             exec(ai_data["cad_script"], {}, local_env)
             final_mesh = local_env["final_mesh"]
 
+        if isinstance(final_mesh, trimesh.Scene):
+            final_mesh = trimesh.util.concatenate(tuple(final_mesh.geometry.values()))
+
         trimesh.repair.fill_holes(final_mesh)
         trimesh.repair.fix_normals(final_mesh)
-        final_mesh.apply_translation([0, 0, -final_mesh.bounds[0][2]])
+        final_mesh.apply_translation([
+            -final_mesh.centroid[0],
+            -final_mesh.centroid[1],
+            -final_mesh.bounds[0][2]
+        ])
         final_mesh.export(verified_stl_path)
 
         slicer_cmd = [
             "prusa-slicer",
             "--export-gcode",
+            "--center", "100,100",
             "--support-material",
             "--support-material-auto",
             "--layer-height", "0.2",
@@ -245,22 +261,20 @@ async def generate_3d(req: ChatRequest):
             verified_stl_path
         ]
         proc = subprocess.run(slicer_cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"PrusaSlicer error: {proc.stderr or proc.stdout}")
 
         grams_used = 0.0
         print_time_str = ""
-        with open(gcode_path, "r") as f:
-            for line in f.readlines()[-100:]:
-                if "filament used [g]" in line:
-                    try:
-                        grams_used = float(line.split("=")[1].strip())
-                    except Exception:
-                        pass
-                if "estimated printing time (normal mode)" in line:
-                    print_time_str = line.split("=")[1].strip()
+        if proc.returncode == 0 and os.path.exists(gcode_path):
+            with open(gcode_path, "r") as f:
+                for line in f.readlines()[-100:]:
+                    if "filament used [g]" in line:
+                        try:
+                            grams_used = float(line.split("=")[1].strip())
+                        except Exception:
+                            pass
+                    if "estimated printing time (normal mode)" in line:
+                        print_time_str = line.split("=")[1].strip()
 
-        # Резервна физичка пресметка од волумен (mm3 -> cm3 -> g) ако PrusaSlicer врати 0
         if grams_used <= 0.1:
             vol_cm3 = abs(float(final_mesh.volume)) / 1000.0
             grams_used = max(round(vol_cm3 * 1.24 * 0.45, 1), 1.5)
