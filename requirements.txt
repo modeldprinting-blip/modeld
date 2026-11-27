@@ -6,4 +6,5 @@ trimesh
 numpy
 scipy
 networkx
+manifold3d
 pydantic
