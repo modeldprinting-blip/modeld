@@ -60,7 +60,7 @@ SYSTEM_PROMPT = """
 Врати JSON:
 {
   "status": "ready",
-  "mode": "cad" | "tripo",
+  "mode": "tripo" | "cad",
   "message": "Потврда на македонски дека моделот е физички проверен, поправен (Watertight) и подготвен за 3D печатење.",
   "recommended_material": "PLA" | "PETG" | "ABS" | "TPU",
   "material_reason": "Објаснување на македонски зошто оваа пластика е најдобра за намената.",
@@ -74,7 +74,7 @@ SYSTEM_PROMPT = """
     "print_speed": "50 mm/s",
     "adhesion": "Skirt / Brim 5mm"
   },
-  "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid mesh, high detail: [опис на англиски]",
+  "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid mesh, high detail: [детален опис на англиски]",
   "target_height_mm": 100.0,
   "cad_script": "Целосен Python код со `trimesh`, `np` и `math` кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`."
 }
@@ -178,6 +178,17 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         loaded.apply_scale(scale_factor)
         return loaded
 
+def run_cad_script(cad_script: str):
+    exec_globals = {
+        "__builtins__": __builtins__,
+        "trimesh": trimesh,
+        "np": np,
+        "numpy": np,
+        "math": math
+    }
+    exec(cad_script, exec_globals)
+    return exec_globals["final_mesh"]
+
 @app.post("/api/generate")
 async def generate_3d(req: ChatRequest):
     if not GROQ_API_KEY and not gemini_client:
@@ -230,28 +241,29 @@ async def generate_3d(req: ChatRequest):
     gcode_path = f"generated_models/{model_id}.gcode"
 
     try:
+        final_mesh = None
         if ai_data.get("mode") == "tripo" and TRIPO_API_KEY:
-            final_mesh = await generate_with_tripo(
-                ai_data["tripo_prompt"],
-                verified_stl_path,
-                float(ai_data.get("target_height_mm", 80.0))
-            )
-        else:
-            exec_globals = {
-                "__builtins__": __builtins__,
-                "trimesh": trimesh,
-                "np": np,
-                "numpy": np,
-                "math": math
-            }
-            exec(ai_data["cad_script"], exec_globals)
-            final_mesh = exec_globals["final_mesh"]
+            try:
+                final_mesh = await generate_with_tripo(
+                    ai_data["tripo_prompt"],
+                    verified_stl_path,
+                    float(ai_data.get("target_height_mm", 80.0))
+                )
+            except Exception as tripo_err:
+                print("TRIPO FALLBACK TO CAD:", str(tripo_err))
+
+        if final_mesh is None:
+            final_mesh = run_cad_script(ai_data["cad_script"])
 
         if isinstance(final_mesh, trimesh.Scene):
             final_mesh = trimesh.util.concatenate(tuple(final_mesh.geometry.values()))
 
-        trimesh.repair.fill_holes(final_mesh)
-        trimesh.repair.fix_normals(final_mesh)
+        try:
+            trimesh.repair.fill_holes(final_mesh)
+            trimesh.repair.fix_normals(final_mesh)
+        except Exception as repair_err:
+            print("MESH REPAIR WARNING:", str(repair_err))
+
         final_mesh.apply_translation([
             -final_mesh.centroid[0],
             -final_mesh.centroid[1],
