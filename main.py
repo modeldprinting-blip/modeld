@@ -56,7 +56,7 @@ SYSTEM_PROMPT = """
 - Користи `"mode": "tripo"` за СЕКОЈ уметнички, органски или детален објект: новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил!
 - Користи `"mode": "cad"` САМО за строга инженерска геометрија: прстен, чаша, кутија, држач, плочка, организатор, капак, цевка, конус, везови.
 
-Врати JSON:
+Врати JSON со ТОЧНО овие имиња на полиња:
 {
   "status": "ready",
   "mode": "tripo" | "cad",
@@ -75,7 +75,7 @@ SYSTEM_PROMPT = """
   },
   "tripo_prompt": "Detailed 3D printable model on a flat solid base, clean geometry, no floating parts, solid mesh, high detail: [детален опис на англиски]",
   "target_height_mm": 100.0,
-  "cad_script": "Кратко и чисто Python скриптче со `trimesh`, `np` и `math` кое креира објект `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`."
+  "cad_script": "Чист Python код со `trimesh`, `np` и `math` кој креира објект `final_mesh` во милиметри со ѕидови >= 1.5mm. Користи `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.cone(radius=..., height=...)`, `trimesh.creation.icosphere(radius=...)`, `.difference(...)` и `trimesh.util.concatenate([...])`."
 }
 Одговори ИСКЛУЧИВО со валиден JSON објект, без никаков дополнителен текст пред или после него.
 """
@@ -199,7 +199,12 @@ def run_cad_script(cad_script: str):
         "math": math
     }
     exec(cad_script, exec_globals)
-    return exec_globals["final_mesh"]
+    if "final_mesh" in exec_globals:
+        return exec_globals["final_mesh"]
+    for val in reversed(list(exec_globals.values())):
+        if isinstance(val, (trimesh.Trimesh, trimesh.Scene)):
+            return val
+    raise RuntimeError("CAD скриптата не врати 3D објект.")
 
 @app.post("/api/generate")
 async def generate_3d(req: ChatRequest):
@@ -228,10 +233,11 @@ async def generate_3d(req: ChatRequest):
 
     try:
         final_mesh = None
-        if ai_data.get("mode") == "tripo" and TRIPO_API_KEY:
+        tripo_prompt = ai_data.get("tripo_prompt") or ai_data.get("prompt")
+        if ai_data.get("mode") == "tripo" and TRIPO_API_KEY and tripo_prompt:
             try:
                 final_mesh = await generate_with_tripo(
-                    ai_data["tripo_prompt"],
+                    tripo_prompt,
                     verified_stl_path,
                     float(ai_data.get("target_height_mm", 80.0))
                 )
@@ -239,7 +245,16 @@ async def generate_3d(req: ChatRequest):
                 print("TRIPO FALLBACK TO CAD:", str(tripo_err))
 
         if final_mesh is None:
-            final_mesh = run_cad_script(ai_data["cad_script"])
+            script_code = (
+                ai_data.get("cad_script")
+                or ai_data.get("scad")
+                or ai_data.get("script")
+                or ai_data.get("code")
+                or ai_data.get("python_code")
+            )
+            if not script_code:
+                raise RuntimeError(f"AI не испрати CAD код (клучеви: {list(ai_data.keys())})")
+            final_mesh = run_cad_script(script_code)
 
         if isinstance(final_mesh, trimesh.Scene):
             final_mesh = trimesh.util.concatenate(tuple(final_mesh.geometry.values()))
@@ -312,9 +327,9 @@ async def generate_3d(req: ChatRequest):
             "status": "ready",
             "model_id": model_id,
             "stl_url": f"/models/{model_id}_verified.stl",
-            "message": ai_data["message"],
+            "message": ai_data.get("message", "Моделот е подготвен за 3D печатење!"),
             "recommended_material": rec_mat,
-            "material_reason": ai_data["material_reason"],
+            "material_reason": ai_data.get("material_reason", "Оптимален материјал според намената и оптоварувањето."),
             "slicer_settings": slicer_settings,
             "stats": {
                 "grams": round(grams_used, 1),
