@@ -13,8 +13,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
 
 app = FastAPI(title="Model D — AI 3D CAD & Slicer Engine")
 
@@ -29,10 +27,7 @@ os.makedirs("generated_models", exist_ok=True)
 app.mount("/models", StaticFiles(directory="generated_models"), name="models")
 
 GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
-GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
 TRIPO_API_KEY = (os.environ.get("TRIPO_API_KEY") or "").strip()
-
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 MATERIAL_PRICES_MKD_PER_G = {
     "PLA": 1.5,
@@ -101,8 +96,7 @@ def health_check():
         "status": "online",
         "service": "Model D Backend",
         "tripo_enabled": bool(TRIPO_API_KEY),
-        "groq_enabled": bool(GROQ_API_KEY),
-        "gemini_enabled": bool(GEMINI_API_KEY)
+        "groq_enabled": bool(GROQ_API_KEY)
     }
 
 def extract_json_object(text: str) -> dict:
@@ -127,8 +121,8 @@ async def call_groq(history: list[dict]) -> str:
         "Content-Type": "application/json"
     }
     groq_models = [
-        "openai/gpt-oss-120b",
         "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
         "qwen/qwen3-32b",
         "openai/gpt-oss-20b"
     ]
@@ -212,38 +206,14 @@ def run_cad_script(cad_script: str):
 
 @app.post("/api/generate")
 async def generate_3d(req: ChatRequest):
-    if not GROQ_API_KEY and not gemini_client:
+    if not GROQ_API_KEY:
         return {"status": "needs_info", "message": "Грешка: Нема поставено GROQ_API_KEY на серверот."}
 
-    raw_text = None
-    last_err = None
-
-    if GROQ_API_KEY:
-        try:
-            raw_text = await call_groq(req.history)
-        except Exception as e:
-            last_err = e
-            print("GROQ ERROR:", traceback.format_exc())
-
-    if raw_text is None and gemini_client:
-        conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
-        for m_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
-            try:
-                response = gemini_client.models.generate_content(
-                    model=m_name,
-                    contents=conversation_text,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        response_mime_type="application/json"
-                    )
-                )
-                raw_text = response.text.strip()
-                break
-            except Exception as e:
-                last_err = e
-
-    if raw_text is None:
-        return {"status": "needs_info", "message": f"AI грешка: {str(last_err)}"}
+    try:
+        raw_text = await call_groq(req.history)
+    except Exception as e:
+        print("GROQ ERROR:", traceback.format_exc())
+        return {"status": "needs_info", "message": f"Groq AI грешка: {str(e)}"}
 
     try:
         ai_data = extract_json_object(raw_text)
@@ -372,3 +342,4 @@ async def create_order(order: OrderRequest):
     with open("orders_database.jsonl", "a", encoding="utf-8") as db:
         db.write(json.dumps(order_record, ensure_ascii=False) + "\n")
     return {"status": "confirmed", "message": "Нарачката е примена! Проверениот STL фајл е подготвен за 3D печатач."}
+    
