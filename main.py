@@ -7,7 +7,7 @@ import traceback
 import httpx
 import trimesh
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -63,6 +63,16 @@ SYSTEM_PROMPT = """
   "message": "Потврда на македонски дека моделот е физички проверен, поправен (Watertight) и исечен во PrusaSlicer.",
   "recommended_material": "PLA" | "PETG" | "ABS" | "TPU",
   "material_reason": "Објаснување на македонски зошто оваа пластика е најдобра за намената.",
+  "slicer_settings": {
+    "layer_height": "0.20 mm",
+    "infill": "20% (Gyroid / Grid)",
+    "walls": "3 периметри (1.2 mm)",
+    "supports": "Не се потребни / Auto (Touching buildplate)",
+    "nozzle_temp": "210°C",
+    "bed_temp": "60°C",
+    "print_speed": "50 mm/s",
+    "adhesion": "Skirt / Brim 5mm"
+  },
   "tripo_prompt": "Детален опис на англиски за 3D моделот (ако mode е tripo), без позадина, solid 3d printable object",
   "target_height_mm": 80.0,
   "cad_script": "Целосен Python код со библиотеката `trimesh` (и `np`) кој креира објект наречен `final_mesh` во милиметри со ѕидови >= 1.5mm (ако mode е cad). Користи исклучиво `trimesh.creation.box`, `trimesh.creation.cylinder`, `trimesh.creation.capsule`, `trimesh.creation.annulus(r_min=..., r_max=..., height=...)` и `trimesh.util.concatenate([...])`! Не користи boolean difference/intersection за да нема потреба од надворешни библиотеки."
@@ -72,6 +82,9 @@ SYSTEM_PROMPT = """
 
 class ChatRequest(BaseModel):
     history: list[dict]
+    service_mode: str = "full"
+    printer_bed: str | None = None
+    slicer_software: str | None = None
 
 class OrderRequest(BaseModel):
     model_id: str
@@ -157,7 +170,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
 @app.post("/api/generate")
 async def generate_3d(req: ChatRequest):
     if not GROQ_API_KEY and not gemini_client:
-        return {"status": "needs_info", "message": "Грешка: Нема поставено GROQ_API_KEY или GEMINI_API_KEY на серверот."}
+        return {"status": "needs_info", "message": "Грешка: Нема поставено GROQ_API_KEY на серверот."}
 
     raw_text = None
     last_err = None
@@ -171,7 +184,7 @@ async def generate_3d(req: ChatRequest):
 
     if raw_text is None and gemini_client:
         conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
-        for m_name in ["gemini-3.8-flash", "gemini-3.8-flash-lite"]:
+        for m_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
             try:
                 response = gemini_client.models.generate_content(
                     model=m_name,
@@ -187,10 +200,7 @@ async def generate_3d(req: ChatRequest):
                 last_err = e
 
     if raw_text is None:
-        return {
-            "status": "needs_info",
-            "message": f"AI грешка: {str(last_err)}"
-        }
+        return {"status": "needs_info", "message": f"AI грешка: {str(last_err)}"}
 
     try:
         clean_json = raw_text.strip()
@@ -251,6 +261,18 @@ async def generate_3d(req: ChatRequest):
         material_cost = grams_used * MATERIAL_PRICES_MKD_PER_G.get(rec_mat, 1.5)
         selling_price = round(material_cost * 3, 0)
 
+        default_slicer = {
+            "layer_height": "0.20 mm",
+            "infill": "20% (Gyroid)",
+            "walls": "3 периметри (1.2 mm)",
+            "supports": "Auto (Touching buildplate)",
+            "nozzle_temp": "210°C (PLA) / 240°C (PETG)",
+            "bed_temp": "60°C (PLA) / 80°C (PETG)",
+            "print_speed": "50 mm/s",
+            "adhesion": "Brim 5 mm"
+        }
+        slicer_settings = ai_data.get("slicer_settings") or default_slicer
+
         return {
             "status": "ready",
             "model_id": model_id,
@@ -258,6 +280,7 @@ async def generate_3d(req: ChatRequest):
             "message": ai_data["message"],
             "recommended_material": rec_mat,
             "material_reason": ai_data["material_reason"],
+            "slicer_settings": slicer_settings,
             "stats": {
                 "grams": round(grams_used, 1),
                 "print_time": print_time_str,
