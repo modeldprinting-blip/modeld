@@ -369,4 +369,4 @@ async def create_order(order: OrderRequest):
     order_record["verified_file"] = f"generated_models/{order.model_id}_verified.stl"
     with open("orders_database.jsonl", "a", encoding="utf-8") as db:
         db.write(json.dumps(order_record, ensure_ascii=False) + "\n")
-    return {"status": "confirmed", "message": "Нарачката е примена! Проверениот STL фајл е подготвен за 3D печатач."}
+    return {"status": "confirmed", "message": "Нарачката е примена! Проверениот STL фајл е подготвен за 3D печатач."} 
