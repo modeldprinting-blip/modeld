@@ -94,17 +94,24 @@ async def call_groq(history: list[dict]) -> str:
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": messages,
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2
-    }
+    groq_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
+    last_error = None
+
     async with httpx.AsyncClient(timeout=30.0) as http:
-        res = await http.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
-        if res.status_code != 200:
-            raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text}")
-        return res.json()["choices"][0]["message"]["content"]
+        for model_name in groq_models:
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2
+            }
+            res = await http.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+            if res.status_code == 200:
+                return res.json()["choices"][0]["message"]["content"]
+            last_error = f"Groq HTTP {res.status_code} ({model_name}): {res.text}"
+            print("GROQ RETRY:", last_error)
+
+    raise RuntimeError(last_error)
 
 async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_mm: float):
     headers = {
@@ -155,7 +162,7 @@ async def generate_3d(req: ChatRequest):
     raw_text = None
     last_err = None
 
-    # 1. Примарен провајдер: Groq (ултра-брз, без 503 преоптоварување)
+    # 1. Примарен провајдер: Groq
     if GROQ_API_KEY:
         try:
             raw_text = await call_groq(req.history)
@@ -163,7 +170,7 @@ async def generate_3d(req: ChatRequest):
             last_err = e
             print("GROQ ERROR:", str(e))
 
-    # 2. Резервен провајдер: Gemini (ако Groq не е поставен или падне)
+    # 2. Резервен провајдер: Gemini
     if raw_text is None and gemini_client:
         conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in req.history])
         for m_name in ["gemini-3.8-flash", "gemini-3.8-flash-lite"]:
