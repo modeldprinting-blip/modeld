@@ -6,7 +6,8 @@ import math
 import asyncio
 import subprocess
 import traceback
-import httpx
+import urllib.request
+import urllib.error
 import trimesh
 import numpy as np
 from groq import AsyncGroq
@@ -31,6 +32,24 @@ GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
 TRIPO_API_KEY = (os.environ.get("TRIPO_API_KEY") or "").strip()
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# Директен HTTP opener без системски proxy променливи
+no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def http_json_request(url: str, headers: dict, payload: dict | None = None, timeout: int = 60) -> dict:
+    data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST" if payload is not None else "GET")
+    try:
+        with no_proxy_opener.open(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"HTTP {e.code}: {err_body}")
+
+def http_download_bytes(url: str, timeout: int = 90) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "ModelD/1.0"})
+    with no_proxy_opener.open(req, timeout=timeout) as resp:
+        return resp.read()
 
 MATERIAL_PRICES_MKD_PER_G = {
     "PLA": 1.5,
@@ -65,7 +84,7 @@ SYSTEM_PROMPT = """
 КРИТИЧНИ ПРАВИЛА ЗА `tripo_prompt`:
 - Дури и ако корисникот напише долг текст со барања за STEP фајлови, технички цртежи, документација или милиметри, во `tripo_prompt` НИКОГАШ не ги вклучувај тие зборови и НИКОГАШ не ставај бројки!
 - Напиши САМО краток, чист визуелен опис на самиот 3D објект во 10-20 зборови на англиски (пр. "A single 3D printable ergonomic snowboard binding with curved highback heel support, flat baseplate, and side strap loops").
-- Во `cad_script` напиши ИСКЛУЧИВО краток, 100% валиден Python код со `trimesh` кој ја дефинира `final_mesh` (НИКОГАШ обична коцка за сложени предмети; направи композиција од повеќе делови со `trimesh.util.concatenate`).
+- Во `cad_script` напиши ИСКЛУЧИВО краток, 100% валиден Python код со `trimesh` кој ја дефинира `final_mesh`.
 - Во `target_height_mm` стави ја висината во милиметри (минимум 15.0, максимум 220.0).
 
 Врати JSON со ТОЧНО овие имиња на полиња:
@@ -123,20 +142,25 @@ async def test_tripo_connection():
         "Authorization": f"Bearer {TRIPO_API_KEY}"
     }
     try:
-        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as http:
-            bal_res = await http.get("https://api.tripo3d.ai/v2/openapi/user/balance", headers=headers)
-            task_res = await http.post(
-                "https://api.tripo3d.ai/v2/openapi/task",
-                headers=headers,
-                json={"type": "text_to_model", "prompt": "a simple small star ornament"}
-            )
-            return {
-                "ok": task_res.json().get("code") == 0,
-                "balance_status": bal_res.status_code,
-                "balance_response": bal_res.json(),
-                "task_status": task_res.status_code,
-                "task_response": task_res.json()
-            }
+        bal = await asyncio.to_thread(
+            http_json_request,
+            "https://api.tripo3d.ai/v2/openapi/user/balance",
+            headers,
+            None,
+            25
+        )
+        task = await asyncio.to_thread(
+            http_json_request,
+            "https://api.tripo3d.ai/v2/openapi/task",
+            headers,
+            {"type": "text_to_model", "prompt": "a simple small star ornament"},
+            25
+        )
+        return {
+            "ok": task.get("code") == 0,
+            "balance": bal,
+            "task": task
+        }
     except Exception as e:
         return {"ok": False, "exception": str(e)}
 
@@ -187,55 +211,61 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         "Content-Type": "application/json",
         "Authorization": f"Bearer {TRIPO_API_KEY}"
     }
-    async with httpx.AsyncClient(timeout=120.0, trust_env=False) as http:
-        res = await http.post(
-            "[https://api.tripo3d.ai/v2/openapi/task](https://api.tripo3d.ai/v2/openapi/task)",
-            headers=headers,
-            json={"type": "text_to_model", "prompt": clean_prompt}
+    res_data = await asyncio.to_thread(
+        http_json_request,
+        "[https://api.tripo3d.ai/v2/openapi/task](https://api.tripo3d.ai/v2/openapi/task)",
+        headers,
+        {"type": "text_to_model", "prompt": clean_prompt},
+        30
+    )
+    if res_data.get("code") != 0:
+        raise RuntimeError(f"Tripo API одби ({res_data.get('code')}): {res_data.get('message')}")
+    task_id = res_data["data"]["task_id"]
+
+    model_url = None
+    for _ in range(60):
+        await asyncio.sleep(2)
+        status_res = await asyncio.to_thread(
+            http_json_request,
+            f"[https://api.tripo3d.ai/v2/openapi/task/](https://api.tripo3d.ai/v2/openapi/task/){task_id}",
+            headers,
+            None,
+            25
         )
-        res_data = res.json()
-        if res_data.get("code") != 0:
-            raise RuntimeError(f"Tripo API ({res_data.get('code')}): {res_data.get('message')}")
-        task_id = res_data["data"]["task_id"]
+        s_data = status_res.get("data", {})
+        st = s_data.get("status")
+        if st == "success":
+            out = s_data.get("output", {})
+            model_url = out.get("model") or out.get("pbr_model") or out.get("base_model")
+            break
+        elif st in ["failed", "cancelled", "banned"]:
+            raise RuntimeError(f"Tripo статус: {st}")
 
-        model_url = None
-        for _ in range(60):
-            await asyncio.sleep(2)
-            status_res = await http.get(f"[https://api.tripo3d.ai/v2/openapi/task/](https://api.tripo3d.ai/v2/openapi/task/){task_id}", headers=headers)
-            s_data = status_res.json().get("data", {})
-            st = s_data.get("status")
-            if st == "success":
-                out = s_data.get("output", {})
-                model_url = out.get("model") or out.get("pbr_model") or out.get("base_model")
-                break
-            elif st in ["failed", "cancelled", "banned"]:
-                raise RuntimeError(f"Tripo статус: {st}")
+    if not model_url:
+        raise RuntimeError("Tripo истече времето (timeout).")
 
-        if not model_url:
-            raise RuntimeError("Tripo истече времето (timeout).")
+    glb_path = output_stl_path.replace(".stl", ".glb")
+    glb_bytes = await asyncio.to_thread(http_download_bytes, model_url, 90)
+    with open(glb_path, "wb") as f:
+        f.write(glb_bytes)
 
-        glb_path = output_stl_path.replace(".stl", ".glb")
-        glb_bytes = (await http.get(model_url)).content
-        with open(glb_path, "wb") as f:
-            f.write(glb_bytes)
+    loaded = trimesh.load(glb_path, force="mesh")
+    if isinstance(loaded, trimesh.Scene):
+        loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
 
-        loaded = trimesh.load(glb_path, force="mesh")
-        if isinstance(loaded, trimesh.Scene):
-            loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+    rot_x = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
+    loaded.apply_transform(rot_x)
 
-        rot_x = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
-        loaded.apply_transform(rot_x)
+    current_height = loaded.extents[2] if loaded.extents[2] > 0 else 1.0
+    clamped_height = min(max(target_height_mm, 15.0), 220.0)
+    scale_factor = clamped_height / current_height
+    loaded.apply_scale(scale_factor)
 
-        current_height = loaded.extents[2] if loaded.extents[2] > 0 else 1.0
-        clamped_height = min(max(target_height_mm, 15.0), 220.0)
-        scale_factor = clamped_height / current_height
-        loaded.apply_scale(scale_factor)
+    max_xy = max(loaded.extents[0], loaded.extents[1])
+    if max_xy > 230.0:
+        loaded.apply_scale(230.0 / max_xy)
 
-        max_xy = max(loaded.extents[0], loaded.extents[1])
-        if max_xy > 230.0:
-            loaded.apply_scale(230.0 / max_xy)
-
-        return loaded
+    return loaded
 
 def run_cad_script(cad_script: str):
     exec_globals = {
