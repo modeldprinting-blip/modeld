@@ -1,5 +1,6 @@
 import os
 import re
+import ssl
 import json
 import uuid
 import math
@@ -33,12 +34,28 @@ TRIPO_API_KEY = (os.environ.get("TRIPO_API_KEY") or "").strip()
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Директен HTTP opener без системски proxy променливи
-no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# Директен HTTPS + HTTP opener без системски proxy променливи
+ssl_ctx = ssl.create_default_context()
+no_proxy_opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    urllib.request.HTTPHandler(),
+    urllib.request.HTTPSHandler(context=ssl_ctx)
+)
+
+def clean_url(raw_url: str) -> str:
+    u = str(raw_url).strip()
+    m = re.search(r"https?://[^\s\]\)\"']+", u)
+    return m.group(0) if m else u.strip("[]()\"' ")
 
 def http_json_request(url: str, headers: dict, payload: dict | None = None, timeout: int = 60) -> dict:
+    target_url = clean_url(url)
     data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST" if payload is not None else "GET")
+    req = urllib.request.Request(
+        target_url,
+        data=data_bytes,
+        headers=headers,
+        method="POST" if payload is not None else "GET"
+    )
     try:
         with no_proxy_opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -47,7 +64,8 @@ def http_json_request(url: str, headers: dict, payload: dict | None = None, time
         raise RuntimeError(f"HTTP {e.code}: {err_body}")
 
 def http_download_bytes(url: str, timeout: int = 90) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "ModelD/1.0"})
+    target_url = clean_url(url)
+    req = urllib.request.Request(target_url, headers={"User-Agent": "ModelD/1.0"})
     with no_proxy_opener.open(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -78,12 +96,12 @@ SYSTEM_PROMPT = """
 }
 
 Ако СЕ е јасно и физички возможно за печатење, одлучи кој генератор е подобар:
-- Користи `"mode": "tripo"` за 95% од предметите: СЕКОЈ реален, ергономски, уметнички, органски или детален објект (држач за телефон, новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил, сноуборд везови, маска, рачка, кацига, вазна, чаша со релјеф, резервен дел).
+- Користи `"mode": "tripo"` за 95% од предметите: СЕКОЈ реален, ергономски, уметнички, органски или детален објект (маска за телефон, држач за телефон, новогодишна елка, украс, фигура, животно, скулптура, статуа, играчка, карактер, цвет, автомобил, сноуборд везови, кацига, вазна, чаша со релјеф, резервен дел).
 - Користи `"mode": "cad"` ИСКЛУЧИВО за наједноставна геометрија од 1 форма: обичен прстен, цилиндар, коцка, рамна плочка, цевка, конус.
 
 КРИТИЧНИ ПРАВИЛА ЗА `tripo_prompt`:
 - Дури и ако корисникот напише долг текст со барања за STEP фајлови, технички цртежи, документација или милиметри, во `tripo_prompt` НИКОГАШ не ги вклучувај тие зборови и НИКОГАШ не ставај бројки!
-- Напиши САМО краток, чист визуелен опис на самиот 3D објект во 10-20 зборови на англиски (пр. "A single 3D printable ergonomic snowboard binding with curved highback heel support, flat baseplate, and side strap loops").
+- Напиши САМО краток, чист визуелен опис на самиот 3D објект во 10-20 зборови на англиски (пр. "A protective smartphone case shell with camera cutout, button openings, and textured grip back").
 - Во `cad_script` напиши ИСКЛУЧИВО краток, 100% валиден Python код со `trimesh` кој ја дефинира `final_mesh`.
 - Во `target_height_mm` стави ја висината во милиметри (минимум 15.0, максимум 220.0).
 
