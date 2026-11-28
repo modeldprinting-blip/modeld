@@ -64,8 +64,8 @@ SYSTEM_PROMPT = """
 
 КРИТИЧНИ ПРАВИЛА ЗА `tripo_prompt`:
 - Дури и ако корисникот напише долг текст со барања за STEP фајлови, технички цртежи, документација или милиметри, во `tripo_prompt` НИКОГАШ не ги вклучувај тие зборови и НИКОГАШ не ставај бројки!
-- Напиши САМО краток, чист визуелен опис на самиот 3D објект во 10-20 зборови на англиски (пр. "A sleek modern smartphone desk stand with angled backrest, bottom lip, charging cable slot, and two side support ribs").
-- Во `cad_script` напиши ИСКЛУЧИВО краток, 100% валиден Python код со `trimesh` кој ја дефинира `final_mesh` (користејќи само `trimesh.creation.box`, `cylinder`, `cone`, `icosphere` и `trimesh.util.concatenate`).
+- Напиши САМО краток, чист визуелен опис на самиот 3D објект во 10-20 зборови на англиски (пр. "A single 3D printable ergonomic snowboard binding with curved highback heel support, flat baseplate, and side strap loops").
+- Во `cad_script` напиши ИСКЛУЧИВО краток, 100% валиден Python код со `trimesh` кој ја дефинира `final_mesh` (НИКОГАШ обична коцка за сложени предмети; направи композиција од повеќе делови со `trimesh.util.concatenate`).
 - Во `target_height_mm` стави ја висината во милиметри (минимум 15.0, максимум 220.0).
 
 Врати JSON со ТОЧНО овие имиња на полиња:
@@ -113,6 +113,32 @@ def health_check():
         "tripo_enabled": bool(TRIPO_API_KEY),
         "groq_enabled": bool(GROQ_API_KEY)
     }
+
+@app.get("/test-tripo")
+async def test_tripo_connection():
+    if not TRIPO_API_KEY:
+        return {"ok": False, "error": "TRIPO_API_KEY не е поставен во Railway Variables!"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {TRIPO_API_KEY}"
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as http:
+            bal_res = await http.get("https://api.tripo3d.ai/v2/openapi/user/balance", headers=headers)
+            task_res = await http.post(
+                "https://api.tripo3d.ai/v2/openapi/task",
+                headers=headers,
+                json={"type": "text_to_model", "prompt": "a simple small star ornament"}
+            )
+            return {
+                "ok": task_res.json().get("code") == 0,
+                "balance_status": bal_res.status_code,
+                "balance_response": bal_res.json(),
+                "task_status": task_res.status_code,
+                "task_response": task_res.json()
+            }
+    except Exception as e:
+        return {"ok": False, "exception": str(e)}
 
 def extract_json_object(text: str) -> dict:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -169,7 +195,7 @@ async def generate_with_tripo(prompt: str, output_stl_path: str, target_height_m
         )
         res_data = res.json()
         if res_data.get("code") != 0:
-            raise RuntimeError(f"Tripo API одби ({res_data.get('code')}): {res_data.get('message')}")
+            raise RuntimeError(f"Tripo API ({res_data.get('code')}): {res_data.get('message')}")
         task_id = res_data["data"]["task_id"]
 
         model_url = None
@@ -254,6 +280,7 @@ async def generate_3d(req: ChatRequest):
 
     try:
         final_mesh = None
+        tripo_debug_note = ""
         full_user_text = " ".join([m.get("content", "").lower() for m in req.history if m.get("role") == "user"])
         is_pure_simple_cad = any(kw in full_user_text for kw in PURE_CAD_KEYWORDS) and len(full_user_text) < 90
 
@@ -271,6 +298,7 @@ async def generate_3d(req: ChatRequest):
                     float(ai_data.get("target_height_mm") or 80.0)
                 )
             except Exception as tripo_err:
+                tripo_debug_note = f" (Tripo забелешка: {str(tripo_err)})"
                 print("TRIPO FALLBACK:", traceback.format_exc())
 
         if final_mesh is None:
@@ -287,16 +315,6 @@ async def generate_3d(req: ChatRequest):
                     final_mesh = run_cad_script(script_code)
                 except Exception:
                     print("CAD FALLBACK:", traceback.format_exc())
-
-            if final_mesh is None and TRIPO_API_KEY and not use_tripo:
-                try:
-                    final_mesh = await generate_with_tripo(
-                        tripo_prompt,
-                        verified_stl_path,
-                        float(ai_data.get("target_height_mm") or 80.0)
-                    )
-                except Exception:
-                    print("SECOND TRIPO FALLBACK:", traceback.format_exc())
 
             if final_mesh is None:
                 h = min(max(float(ai_data.get("target_height_mm") or 60.0), 15.0), 200.0)
@@ -377,11 +395,12 @@ async def generate_3d(req: ChatRequest):
         }
         slicer_settings = ai_data.get("slicer_settings") or default_slicer
 
+        base_msg = ai_data.get("message", "Моделот е подготвен за 3D печатење!")
         return {
             "status": "ready",
             "model_id": model_id,
             "stl_url": f"/models/{model_id}_verified.stl",
-            "message": ai_data.get("message", "Моделот е подготвен за 3D печатење!"),
+            "message": base_msg + tripo_debug_note,
             "recommended_material": rec_mat,
             "material_reason": ai_data.get("material_reason", "Оптимален материјал според намената и оптоварувањето."),
             "slicer_settings": slicer_settings,
