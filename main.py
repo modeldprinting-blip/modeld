@@ -42,6 +42,8 @@ no_proxy_opener = urllib.request.build_opener(
     urllib.request.HTTPSHandler(context=ssl_ctx)
 )
 
+BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
 def clean_url(raw_url: str) -> str:
     u = str(raw_url).strip()
     m = re.search(r"https?://[^\s\]\)\"']+", u)
@@ -49,11 +51,16 @@ def clean_url(raw_url: str) -> str:
 
 def http_json_request(url: str, headers: dict, payload: dict | None = None, timeout: int = 60) -> dict:
     target_url = clean_url(url)
+    req_headers = {
+        "User-Agent": BROWSER_USER_AGENT,
+        "Accept": "application/json",
+        **headers
+    }
     data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
         target_url,
         data=data_bytes,
-        headers=headers,
+        headers=req_headers,
         method="POST" if payload is not None else "GET"
     )
     try:
@@ -65,7 +72,13 @@ def http_json_request(url: str, headers: dict, payload: dict | None = None, time
 
 def http_download_bytes(url: str, timeout: int = 90) -> bytes:
     target_url = clean_url(url)
-    req = urllib.request.Request(target_url, headers={"User-Agent": "ModelD/1.0"})
+    req = urllib.request.Request(
+        target_url,
+        headers={
+            "User-Agent": BROWSER_USER_AGENT,
+            "Accept": "*/*"
+        }
+    )
     with no_proxy_opener.open(req, timeout=timeout) as resp:
         return resp.read()
 
